@@ -33,12 +33,11 @@ use usb_device::{
 use usbd_midi::message::{ControlFunction, U7};
 use usbd_midi::CableNumber;
 use usbd_midi::Message::ControlChange;
-use usbd_midi::{
-    message::{Channel},
-    UsbMidiClass,
-};
+use usbd_midi::{message::Channel, UsbMidiClass};
 
 const PEDALS: usize = 2;
+const CC_BANK_A: u8 = 1;
+const CC_BANK_B: u8 = 64;
 
 #[entry]
 fn main() -> ! {
@@ -59,7 +58,7 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let _delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     let pins = gpio::Pins::new(
         pac.IO_BANK0,
@@ -84,6 +83,16 @@ fn main() -> ! {
         pins.gpio16.reconfigure().into_dyn_pin(),
         pins.gpio17.reconfigure().into_dyn_pin(),
     ];
+    let mut pedal_debouncers: Vec<_, PEDALS> =
+        pedal_pins.iter().map(|_| Debouncer::new(1000)).collect();
+
+    let switch_pin: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio14.reconfigure();
+    let mut switch_debouncer = Debouncer::new(1000);
+
+    let control_changes_a = create_ccs(CC_BANK_A);
+    let control_changes_b = create_ccs(CC_BANK_B);
+
+    led_pin.set_high().unwrap();
 
     let mut midi = UsbMidiClass::new(&usb_bus, 1, 0).unwrap();
 
@@ -99,37 +108,57 @@ fn main() -> ! {
 
     info!("usb device is created");
 
-    let mut debouncers: Vec<_, PEDALS> = pedal_pins.iter().map(|_| Debouncer::new(1000)).collect();
-
-    let ccs: Vec<_, PEDALS> = pedal_pins
-        .iter()
-        .enumerate()
-        .map(|(i, _)| ControlFunction((i as u8 + 1).try_into().unwrap()))
-        .collect();
-
-    led_pin.set_high().unwrap();
+    let mut control_changes = &control_changes_a;
 
     loop {
+        // Poll USB device to keep connection alive
         usb_dev.poll(&mut [&mut midi]);
 
-        for (pin, debouncer, cc) in izip!(&pedal_pins, &mut debouncers, &ccs) {
+        // Determine the CC values based on the switch setting
+        switch_debouncer.update(switch_pin.is_high().unwrap());
+        if switch_debouncer.stable_rising_edge() {
+            // Send pedal off to all B channels (when switching)
+            for cc in &control_changes_b {
+                send_midi_cc(&mut midi, cc, U7::MIN).ok();
+                delay.delay_ms(1);
+            }
+            // Set current channels to A
+            control_changes = &control_changes_a;
+        } else if switch_debouncer.stable_falling_edge() {
+            for cc in &control_changes_a {
+                send_midi_cc(&mut midi, cc, U7::MIN).ok();
+                delay.delay_ms(1);
+            }
+            // Set current channels to B
+            control_changes = &control_changes_b;
+        }
+
+        for (pin, debouncer, cc) in izip!(&pedal_pins, &mut pedal_debouncers, control_changes) {
             debouncer.update(pin.is_high().unwrap());
 
             if debouncer.stable_falling_edge() {
-                midi.send_packet(
-                    ControlChange(Channel::Channel1, cc.clone(), U7::MAX)
-                        .into_packet(CableNumber::Cable0),
-                )
-                .ok();
+                send_midi_cc(&mut midi, cc, U7::MAX).ok();
             }
 
             if debouncer.stable_rising_edge() {
-                midi.send_packet(
-                    ControlChange(Channel::Channel1, cc.clone(), U7::MIN)
-                        .into_packet(CableNumber::Cable0),
-                )
-                .ok();
+                send_midi_cc(&mut midi, cc, U7::MIN).ok();
             }
         }
     }
+}
+
+fn send_midi_cc(
+    midi: &mut UsbMidiClass<UsbBus>,
+    cc: &ControlFunction,
+    value: U7,
+) -> usb_device::Result<usize> {
+    midi.send_packet(
+        ControlChange(Channel::Channel1, cc.clone(), value).into_packet(CableNumber::Cable0),
+    )
+}
+
+fn create_ccs(offset: u8) -> Vec<ControlFunction, 2> {
+    (0..PEDALS as u8)
+        .map(|i| ControlFunction((i + offset).try_into().unwrap()))
+        .collect()
 }
