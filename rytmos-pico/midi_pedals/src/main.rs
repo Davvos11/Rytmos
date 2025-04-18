@@ -109,6 +109,7 @@ fn main() -> ! {
     info!("usb device is created");
 
     let mut control_changes = &control_changes_a;
+    let mut pressed = pedal_pins.iter().filter(|p| p.is_high().unwrap()).count();
 
     loop {
         // Poll USB device to keep connection alive
@@ -138,11 +139,19 @@ fn main() -> ! {
 
             if debouncer.stable_falling_edge() {
                 send_midi_cc(&mut midi, cc, U7::MAX).ok();
+                pressed += 1;
             }
 
             if debouncer.stable_rising_edge() {
                 send_midi_cc(&mut midi, cc, U7::MIN).ok();
+                pressed -= 1;
             }
+        }
+
+        if pressed > 0 {
+            led_pin.set_low().ok();
+        } else {
+            led_pin.set_high().ok();
         }
     }
 }
