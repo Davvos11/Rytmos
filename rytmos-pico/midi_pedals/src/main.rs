@@ -7,16 +7,17 @@
 pub static BOOT2_FIRMWARE: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 use common::debouncer::Debouncer;
-use cortex_m::asm;
 use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::digital::v2::InputPin;
 use embedded_hal::digital::v2::OutputPin;
+use heapless::Vec;
+use itertools::izip;
 use panic_probe as _;
 use rp_pico::{
     entry,
     hal::{
-        clocks::{init_clocks_and_plls, Clock, ClocksManager},
+        clocks::{init_clocks_and_plls, Clock},
         gpio::{self, FunctionSio, Pin, PullUp, SioInput},
         sio::Sio,
         usb::UsbBus,
@@ -29,13 +30,15 @@ use usb_device::{
     bus::UsbBusAllocator,
     device::{UsbDeviceBuilder, UsbVidPid},
 };
-use usbd_midi::message::U7;
+use usbd_midi::message::{ControlFunction, U7};
 use usbd_midi::CableNumber;
-use usbd_midi::UsbMidiEventPacket;
+use usbd_midi::Message::ControlChange;
 use usbd_midi::{
-    message::{Channel, Message, Note},
-    UsbMidiClass, UsbMidiPacketReader,
+    message::{Channel},
+    UsbMidiClass,
 };
+
+const PEDALS: usize = 2;
 
 #[entry]
 fn main() -> ! {
@@ -56,7 +59,7 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let _delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     let pins = gpio::Pins::new(
         pac.IO_BANK0,
@@ -76,7 +79,11 @@ fn main() -> ! {
     ));
 
     let mut led_pin = pins.gpio25.into_push_pull_output();
-    let pedal_pin: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio16.reconfigure();
+
+    let pedal_pins: [Pin<_, FunctionSio<SioInput>, PullUp>; PEDALS] = [
+        pins.gpio16.reconfigure().into_dyn_pin(),
+        pins.gpio17.reconfigure().into_dyn_pin(),
+    ];
 
     let mut midi = UsbMidiClass::new(&usb_bus, 1, 0).unwrap();
 
@@ -92,29 +99,37 @@ fn main() -> ! {
 
     info!("usb device is created");
 
-    let mut pedal_debouncer = Debouncer::new(5000);
+    let mut debouncers: Vec<_, PEDALS> = pedal_pins.iter().map(|_| Debouncer::new(1000)).collect();
+
+    let ccs: Vec<_, PEDALS> = pedal_pins
+        .iter()
+        .enumerate()
+        .map(|(i, _)| ControlFunction((i as u8 + 1).try_into().unwrap()))
+        .collect();
 
     led_pin.set_high().unwrap();
 
     loop {
-        pedal_debouncer.update(pedal_pin.is_high().unwrap());
-
         usb_dev.poll(&mut [&mut midi]);
 
-        if pedal_debouncer.stable_falling_edge() {
-            midi.send_packet(
-                Message::NoteOn(Channel::Channel1, Note::C4, U7::MAX)
-                    .into_packet(CableNumber::Cable0),
-            )
-            .ok();
-        }
+        for (pin, debouncer, cc) in izip!(&pedal_pins, &mut debouncers, &ccs) {
+            debouncer.update(pin.is_high().unwrap());
 
-        if pedal_debouncer.stable_rising_edge() {
-            midi.send_packet(
-                Message::NoteOff(Channel::Channel1, Note::C4, U7::MIN)
-                    .into_packet(CableNumber::Cable0),
-            )
-            .ok();
+            if debouncer.stable_falling_edge() {
+                midi.send_packet(
+                    ControlChange(Channel::Channel1, cc.clone(), U7::MAX)
+                        .into_packet(CableNumber::Cable0),
+                )
+                .ok();
+            }
+
+            if debouncer.stable_rising_edge() {
+                midi.send_packet(
+                    ControlChange(Channel::Channel1, cc.clone(), U7::MIN)
+                        .into_packet(CableNumber::Cable0),
+                )
+                .ok();
+            }
         }
     }
 }
