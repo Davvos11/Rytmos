@@ -35,7 +35,7 @@ use usbd_midi::CableNumber;
 use usbd_midi::Message::ControlChange;
 use usbd_midi::{message::Channel, UsbMidiClass};
 
-const PEDALS: usize = 2;
+const PEDALS: usize = 4;
 const CC_BANK_A: u8 = 1;
 const CC_BANK_B: u8 = 64;
 
@@ -82,6 +82,8 @@ fn main() -> ! {
     let pedal_pins: [Pin<_, FunctionSio<SioInput>, PullUp>; PEDALS] = [
         pins.gpio16.reconfigure().into_dyn_pin(),
         pins.gpio17.reconfigure().into_dyn_pin(),
+        pins.gpio18.reconfigure().into_dyn_pin(),
+        pins.gpio19.reconfigure().into_dyn_pin(),
     ];
     let mut pedal_debouncers: Vec<_, PEDALS> =
         pedal_pins.iter().map(|_| Debouncer::new(1000)).collect();
@@ -166,7 +168,7 @@ fn send_midi_cc(
     )
 }
 
-fn create_ccs(offset: u8) -> Vec<ControlFunction, 2> {
+fn create_ccs(offset: u8) -> Vec<ControlFunction, PEDALS> {
     (0..PEDALS as u8)
         .map(|i| ControlFunction((i + offset).try_into().unwrap()))
         .collect()
