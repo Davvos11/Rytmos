@@ -80,15 +80,15 @@ fn main() -> ! {
     let mut led_pin = pins.gpio25.into_push_pull_output();
 
     let pedal_pins: [Pin<_, FunctionSio<SioInput>, PullUp>; PEDALS] = [
-        pins.gpio16.reconfigure().into_dyn_pin(),
-        pins.gpio17.reconfigure().into_dyn_pin(),
-        pins.gpio18.reconfigure().into_dyn_pin(),
-        pins.gpio19.reconfigure().into_dyn_pin(),
+        pins.gpio0.reconfigure().into_dyn_pin(),
+        pins.gpio1.reconfigure().into_dyn_pin(),
+        pins.gpio2.reconfigure().into_dyn_pin(),
+        pins.gpio3.reconfigure().into_dyn_pin(),
     ];
     let mut pedal_debouncers: Vec<_, PEDALS> =
         pedal_pins.iter().map(|_| Debouncer::new(1000)).collect();
 
-    let switch_pin: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio14.reconfigure();
+    let switch_pin: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio12.reconfigure();
     let mut switch_debouncer = Debouncer::new(1000);
 
     let control_changes_a = create_ccs(CC_BANK_A);
@@ -140,12 +140,15 @@ fn main() -> ! {
             debouncer.update(pin.is_high().unwrap());
 
             if debouncer.stable_falling_edge() {
+                debug!("{} down", pin.id().num);
                 send_midi_cc(&mut midi, cc, U7::MAX).ok();
                 pressed += 1;
             }
 
             if debouncer.stable_rising_edge() {
+                debug!("{} up", pin.id().num);
                 send_midi_cc(&mut midi, cc, U7::MIN).ok();
+                // TODO safe
                 pressed -= 1;
             }
         }
