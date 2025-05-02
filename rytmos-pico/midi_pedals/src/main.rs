@@ -194,8 +194,7 @@ fn main() -> ! {
             if debouncer.stable_rising_edge() {
                 up = true;
                 debug!("{} up (MIDI {})", pin.id().num, u8::from(cc.0.clone()));
-                // TODO safe
-                pressed -= 1;
+                pressed = pressed.saturating_sub(1);
             }
             
             if up || down {
