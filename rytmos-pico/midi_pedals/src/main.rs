@@ -14,6 +14,8 @@ use embedded_hal::digital::v2::OutputPin;
 use heapless::Vec;
 use itertools::izip;
 use panic_probe as _;
+use rp_pico::hal::timer::Instant;
+use rp_pico::hal::Timer;
 use rp_pico::{
     entry,
     hal::{
@@ -60,6 +62,8 @@ fn main() -> ! {
 
     let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
+    let timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
     let pins = gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -88,8 +92,10 @@ fn main() -> ! {
     let mut pedal_debouncers: Vec<_, PEDALS> =
         pedal_pins.iter().map(|_| Debouncer::new(1000)).collect();
 
-    let switch_pin: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio12.reconfigure();
-    let mut switch_debouncer = Debouncer::new(1000);
+    let switch1: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio12.reconfigure();
+    let switch2: Pin<_, FunctionSio<SioInput>, PullUp> = pins.gpio13.reconfigure();
+    let mut switch1_deb = Debouncer::new(1000);
+    let mut switch2_deb = Debouncer::new(1000);
 
     let control_changes_a = create_ccs(CC_BANK_A);
     let control_changes_b = create_ccs(CC_BANK_B);
@@ -110,22 +116,38 @@ fn main() -> ! {
 
     info!("usb device is created");
 
-    let mut control_changes = if switch_pin.is_high().unwrap() {
-        debug!("Starting using bank A (switch 1: {})", switch_pin.is_high().unwrap());
+    let mut control_changes = if switch1.is_high().unwrap() {
+        info!(
+            "Starting using bank A (switch 1: {})",
+            switch1.is_high().unwrap()
+        );
         &control_changes_a
     } else {
-        debug!("Starting using bank B (switch 1: {})", switch_pin.is_high().unwrap());
+        info!(
+            "Starting using bank B (switch 1: {})",
+            switch1.is_high().unwrap()
+        );
         &control_changes_b
     };
+    let mut double_cancellation = switch2.is_high().unwrap();
+    info!(
+        "Starting with double-press cancellation = {}",
+        double_cancellation
+    );
+    // Create counters for each pedal (0: last time pedal up, 1: last time pedal down)
+    let mut last_presses: Vec<_, PEDALS> =
+        pedal_pins.iter().map(|_| (Instant::from_ticks(0), Instant::from_ticks(0))).collect();
     let mut pressed = pedal_pins.iter().filter(|p| p.is_high().unwrap()).count();
 
     loop {
         // Poll USB device to keep connection alive
         usb_dev.poll(&mut [&mut midi]);
 
+        switch1_deb.update(switch1.is_high().unwrap());
+        switch2_deb.update(switch2.is_high().unwrap());
+
         // Determine the CC values based on the switch setting
-        switch_debouncer.update(switch_pin.is_high().unwrap());
-        if switch_debouncer.stable_rising_edge() {
+        if switch1_deb.stable_rising_edge() {
             debug!("Switching to bank A");
             // Send pedal off to all B channels (when switching)
             for cc in &control_changes_b {
@@ -134,7 +156,7 @@ fn main() -> ! {
             }
             // Set current channels to A
             control_changes = &control_changes_a;
-        } else if switch_debouncer.stable_falling_edge() {
+        } else if switch1_deb.stable_falling_edge() {
             debug!("Switching to bank B");
             for cc in &control_changes_a {
                 send_midi_cc(&mut midi, cc, U7::MIN).ok();
@@ -144,20 +166,60 @@ fn main() -> ! {
             control_changes = &control_changes_b;
         }
 
-        for (pin, debouncer, cc) in izip!(&pedal_pins, &mut pedal_debouncers, control_changes) {
+        // Determine if we double-press-cancellation is enabled
+        if switch2_deb.stable_rising_edge() {
+            debug!("Enabling double-press cancellation");
+            double_cancellation = true;
+        } else if switch2_deb.stable_falling_edge() {
+            debug!("Disabling double-press cancellation");
+            double_cancellation = false;
+        }
+
+        for (pin, debouncer, cc, last_pressed) in izip!(
+            &pedal_pins,
+            &mut pedal_debouncers,
+            control_changes,
+            &mut last_presses
+        ) {
             debouncer.update(pin.is_high().unwrap());
+            let mut up = false;
+            let mut down = false;
 
             if debouncer.stable_falling_edge() {
+                down = true;
                 debug!("{} down (MIDI {})", pin.id().num, u8::from(cc.0.clone()));
-                send_midi_cc(&mut midi, cc, U7::MAX).ok();
                 pressed += 1;
             }
 
             if debouncer.stable_rising_edge() {
+                up = true;
                 debug!("{} up (MIDI {})", pin.id().num, u8::from(cc.0.clone()));
-                send_midi_cc(&mut midi, cc, U7::MIN).ok();
                 // TODO safe
                 pressed -= 1;
+            }
+            
+            if up || down {
+                // Determine time since last up or down event and determine if we should cancel
+                let elapsed = if up {
+                    timer.get_counter().checked_duration_since(last_pressed.0)
+                } else {
+                    timer.get_counter().checked_duration_since(last_pressed.1)
+                };
+                let should_cancel = elapsed.map(|e| e.to_millis() <= 500).unwrap_or(false);
+                if double_cancellation && should_cancel {
+                    debug!("Cancelled sending midi ({:?} ms since last press)", elapsed.map(|e| e.to_millis()));
+                }
+                // Send MIDI signal (or cancel)
+                if !double_cancellation || !should_cancel {
+                    let value = if up {U7::MIN} else {U7::MAX};
+                    send_midi_cc(&mut midi, cc, value).ok();
+                }
+                // Update timers
+                if up {
+                    last_pressed.0 = timer.get_counter();
+                } else {
+                    last_pressed.1 = timer.get_counter();
+                }
             }
         }
 
