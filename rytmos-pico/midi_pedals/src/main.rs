@@ -110,7 +110,13 @@ fn main() -> ! {
 
     info!("usb device is created");
 
-    let mut control_changes = &control_changes_a;
+    let mut control_changes = if switch_pin.is_high().unwrap() {
+        debug!("Starting using bank A (switch 1: {})", switch_pin.is_high().unwrap());
+        &control_changes_a
+    } else {
+        debug!("Starting using bank B (switch 1: {})", switch_pin.is_high().unwrap());
+        &control_changes_b
+    };
     let mut pressed = pedal_pins.iter().filter(|p| p.is_high().unwrap()).count();
 
     loop {
@@ -120,6 +126,7 @@ fn main() -> ! {
         // Determine the CC values based on the switch setting
         switch_debouncer.update(switch_pin.is_high().unwrap());
         if switch_debouncer.stable_rising_edge() {
+            debug!("Switching to bank A");
             // Send pedal off to all B channels (when switching)
             for cc in &control_changes_b {
                 send_midi_cc(&mut midi, cc, U7::MIN).ok();
@@ -128,6 +135,7 @@ fn main() -> ! {
             // Set current channels to A
             control_changes = &control_changes_a;
         } else if switch_debouncer.stable_falling_edge() {
+            debug!("Switching to bank B");
             for cc in &control_changes_a {
                 send_midi_cc(&mut midi, cc, U7::MIN).ok();
                 delay.delay_ms(1);
@@ -140,13 +148,13 @@ fn main() -> ! {
             debouncer.update(pin.is_high().unwrap());
 
             if debouncer.stable_falling_edge() {
-                debug!("{} down", pin.id().num);
+                debug!("{} down (MIDI {})", pin.id().num, u8::from(cc.0.clone()));
                 send_midi_cc(&mut midi, cc, U7::MAX).ok();
                 pressed += 1;
             }
 
             if debouncer.stable_rising_edge() {
-                debug!("{} up", pin.id().num);
+                debug!("{} up (MIDI {})", pin.id().num, u8::from(cc.0.clone()));
                 send_midi_cc(&mut midi, cc, U7::MIN).ok();
                 // TODO safe
                 pressed -= 1;
